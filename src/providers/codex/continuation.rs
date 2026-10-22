@@ -17,6 +17,7 @@ struct ContinuationState {
     socket_id: u64,
     prompt_signature: String,
     transcript: Vec<ResponsesInputItem>,
+    native_transcript: Option<Vec<serde_json::Value>>,
     transcript_bytes: u64,
     updated_at: u64,
 }
@@ -64,6 +65,7 @@ pub(crate) struct ContinuationReservation {
     candidate: ContinuationCandidate,
     owner: Option<ConversationIdentity>,
     origin_socket_id: Option<u64>,
+    pub(crate) native_delta: Option<serde_json::Value>,
 }
 
 impl ContinuationReservation {
@@ -76,6 +78,7 @@ impl ContinuationReservation {
             candidate,
             owner,
             origin_socket_id,
+            native_delta: None,
         }
     }
 
@@ -146,6 +149,105 @@ pub fn continuation_candidate(
     continuation_candidate_inner(owner.as_ref(), body, enabled, "missing_session").into_candidate()
 }
 
+fn native_signature(body: &serde_json::Value) -> String {
+    let mut prompt = body.clone();
+    if let Some(object) = prompt.as_object_mut() {
+        for key in ["input", "stream", "previous_response_id", "type"] {
+            object.remove(key);
+        }
+    }
+    serde_json::to_string(&prompt).unwrap_or_default()
+}
+
+pub(crate) fn native_continuation_candidate(
+    owner: Option<&ConversationIdentity>,
+    body: &serde_json::Value,
+    enabled: bool,
+) -> ContinuationReservation {
+    let Some(owner) = owner.filter(|_| enabled) else {
+        return ContinuationReservation::new(
+            ContinuationCandidate {
+                turn_id: None,
+                previous_response_id: None,
+                input_delta: None,
+                input_delta_count: 0,
+                disabled_reason: Some("disabled".into()),
+            },
+            None,
+            None,
+        );
+    };
+    let (turn_id, state, _, now) = reserve_owner_turn(owner);
+    let mut reservation = ContinuationReservation::new(
+        ContinuationCandidate {
+            turn_id: Some(turn_id),
+            previous_response_id: None,
+            input_delta: None,
+            input_delta_count: 0,
+            disabled_reason: Some("missing_state".into()),
+        },
+        Some(owner.clone()),
+        None,
+    );
+    if let Some(state) = state
+        && now.saturating_sub(state.updated_at) <= TTL_MS
+        && state.prompt_signature == native_signature(body)
+        && let Some(prefix) = state.native_transcript
+        && let Some(input) = body.get("input").and_then(serde_json::Value::as_array)
+        && input.len() > prefix.len()
+        && input.starts_with(&prefix)
+    {
+        reservation.candidate.previous_response_id = Some(state.response_id);
+        reservation.candidate.input_delta_count = input.len() - prefix.len();
+        reservation.candidate.disabled_reason = None;
+        reservation.native_delta = Some(serde_json::json!(&input[prefix.len()..]));
+        reservation.origin_socket_id = Some(state.socket_id);
+    }
+    reservation
+}
+
+pub(crate) fn record_native_continuation(
+    reservation: &ContinuationReservation,
+    body: &serde_json::Value,
+    response: &serde_json::Value,
+    socket_id: Option<u64>,
+) {
+    let (Some(owner), Some(turn_id), Some(socket_id), Some(response_id), Some(input), Some(output)) = (
+        reservation.owner(),
+        reservation.turn_id(),
+        socket_id.filter(|id| *id != 0),
+        response.get("id").and_then(serde_json::Value::as_str),
+        body.get("input").and_then(serde_json::Value::as_array),
+        response.get("output").and_then(serde_json::Value::as_array),
+    ) else {
+        abort_continuation_for_owner(reservation);
+        return;
+    };
+    let mut transcript = input.clone();
+    transcript.extend_from_slice(output);
+    let prompt_signature = native_signature(body);
+    let transcript_bytes = serde_json::to_vec(&transcript)
+        .map_or(u64::MAX, |v| v.len() as u64)
+        .saturating_add(prompt_signature.len() as u64);
+    if transcript_bytes > MAX_OWNER_TRANSCRIPT_BYTES {
+        abort_continuation_for_owner(reservation);
+        return;
+    }
+    save_continuation_state(
+        owner,
+        turn_id,
+        ContinuationState {
+            response_id: response_id.into(),
+            socket_id,
+            prompt_signature,
+            transcript: Vec::new(),
+            native_transcript: Some(transcript),
+            transcript_bytes,
+            updated_at: now_ms(),
+        },
+    );
+}
+
 pub(crate) fn continuation_candidate_for_owner(
     owner: Option<&ConversationIdentity>,
     body: &ResponsesRequest,
@@ -188,6 +290,11 @@ fn continuation_candidate_inner(
         );
     };
 
+    let (turn_id, state, superseded_turn, now) = reserve_owner_turn(owner);
+    continuation_candidate_from_state(owner, turn_id, body, state, superseded_turn, now)
+}
+
+fn reserve_owner_turn(owner: &ConversationIdentity) -> (u64, Option<ContinuationState>, bool, u64) {
     let turn_id = NEXT_TURN_ID.fetch_add(1, Ordering::Relaxed);
     let now = now_ms();
     let (state, superseded_turn) = {
@@ -213,7 +320,7 @@ fn continuation_candidate_inner(
         (state, superseded_turn)
     };
 
-    continuation_candidate_from_state(owner, turn_id, body, state, superseded_turn, now)
+    (turn_id, state, superseded_turn, now)
 }
 
 fn continuation_candidate_from_state(
@@ -246,7 +353,7 @@ fn continuation_candidate_from_state(
     };
 
     let signature = prompt_signature(body);
-    if signature != state.prompt_signature {
+    if state.native_transcript.is_some() || signature != state.prompt_signature {
         return ContinuationReservation::new(
             ContinuationCandidate {
                 turn_id: Some(turn_id),
@@ -361,10 +468,16 @@ pub(crate) fn record_continuation_for_owner(
         socket_id,
         prompt_signature: prompt_signature(request_body),
         transcript,
+        native_transcript: None,
         transcript_bytes,
         updated_at: now_ms(),
     };
 
+    save_continuation_state(owner, turn_id, state);
+}
+
+fn save_continuation_state(owner: &ConversationIdentity, turn_id: u64, state: ContinuationState) {
+    let transcript_bytes = state.transcript_bytes;
     let mut guard = REGISTRY.lock().unwrap();
     let Some(registry) = guard.as_mut() else {
         return;
@@ -658,6 +771,97 @@ mod tests {
     use super::super::translate::request::ResponsesFunctionCallOutput;
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_continuation_guards_options_history_expiry_and_owner() {
+        let _guard = lock_registry();
+        let owner = main_owner("native-guards");
+        let body = json!({"model":"gpt-5.5", "input":[{"type":"unknown","x":1}], "tools":[{"type":"future_tool"}], "reasoning":{"effort":"high"}});
+        let output = json!({"type":"future_output","encrypted_content":"opaque"});
+        let response = json!({"id":"resp_raw", "output":[output.clone()]});
+        let mut next = body.clone();
+        next["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend([output, json!({"type":"future_result","value":1})]);
+        for guard in [
+            "model",
+            "tools",
+            "reasoning",
+            "history",
+            "expiry",
+            "owner",
+            "empty",
+        ] {
+            let first = native_continuation_candidate(Some(&owner), &body, true);
+            record_native_continuation(&first, &body, &response, Some(7));
+            let mut changed = next.clone();
+            let other = main_owner("other-native-guards");
+            match guard {
+                "model" => changed["model"] = json!("gpt-5.6-sol"),
+                "tools" => changed["tools"] = json!([]),
+                "reasoning" => changed["reasoning"]["effort"] = json!("low"),
+                "history" => changed["input"][0]["x"] = json!(2),
+                "expiry" => {
+                    REGISTRY
+                        .lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .owners
+                        .get_mut(&owner)
+                        .unwrap()
+                        .continuation
+                        .as_mut()
+                        .unwrap()
+                        .updated_at = 0
+                }
+                "empty" => {
+                    changed["input"].as_array_mut().unwrap().pop();
+                }
+                _ => {}
+            }
+            let candidate = native_continuation_candidate(
+                Some(if guard == "owner" { &other } else { &owner }),
+                &changed,
+                true,
+            );
+            assert!(
+                candidate.candidate().previous_response_id.is_none(),
+                "{guard}"
+            );
+            assert!(candidate.native_delta.is_none(), "{guard}");
+        }
+    }
+
+    #[test]
+    fn native_stale_completion_and_large_prompts_cannot_publish() {
+        let _guard = lock_registry();
+        let owner = main_owner("native-stale");
+        let mut body = json!({"model":"gpt-5.5", "input":[]});
+        let response = json!({"id":"resp_raw", "output":[]});
+        let stale = native_continuation_candidate(Some(&owner), &body, true);
+        let current = native_continuation_candidate(Some(&owner), &body, true);
+        record_native_continuation(&stale, &body, &response, Some(1));
+        assert!(!has_continuation_for_owner_for_tests(&owner));
+        record_native_continuation(&current, &body, &response, Some(2));
+        abort_continuation_for_owner(&stale);
+        assert!(has_continuation_for_owner_for_tests(&owner));
+        body["future_prompt"] = json!("x".repeat(MAX_OWNER_TRANSCRIPT_BYTES as usize));
+        let oversized = native_continuation_candidate(Some(&owner), &body, true);
+        record_native_continuation(&oversized, &body, &response, Some(3));
+        assert!(!has_continuation_for_owner_for_tests(&owner));
+        assert!(
+            native_continuation_candidate(Some(&owner), &body, false)
+                .owner()
+                .is_none()
+        );
+        assert!(
+            native_continuation_candidate(None, &body, true)
+                .turn_id()
+                .is_none()
+        );
+    }
 
     fn lock_registry() -> tokio::sync::MutexGuard<'static, ()> {
         let guard = lock_continuation_registry_for_tests();

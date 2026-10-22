@@ -313,11 +313,24 @@ pub fn build_websocket_request(
     body: &ResponsesRequest,
     continuation: Option<&super::continuation::ContinuationCandidate>,
 ) -> serde_json::Value {
-    let mut payload = serde_json::to_value(body).unwrap_or_default();
+    build_raw_websocket_request(
+        &serde_json::to_value(body).unwrap_or_default(),
+        continuation,
+        None,
+    )
+}
+
+fn build_raw_websocket_request(
+    body: &serde_json::Value,
+    continuation: Option<&super::continuation::ContinuationCandidate>,
+    native_delta: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload = body.clone();
     let obj = payload.as_object_mut().expect("request must be an object");
 
     // Omit the stream field for WebSocket transport
     obj.remove("stream");
+    obj.remove("previous_response_id");
     obj.insert("type".to_string(), serde_json::json!("response.create"));
 
     // Apply continuation if available
@@ -336,6 +349,9 @@ pub fn build_websocket_request(
         }
     }
 
+    if let Some(delta) = native_delta {
+        obj.insert("input".into(), delta.clone());
+    }
     payload
 }
 
@@ -2019,6 +2035,55 @@ impl CodexHttpClient {
         ctx: &RequestContext,
         continuation: Option<&super::continuation::ContinuationReservation>,
     ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        let use_responses_lite = body.client_metadata.is_some();
+        let body = serde_json::to_value(body).map_err(|e| CodexError::new(500, e.to_string()))?;
+        self.start_websocket_value_events_for_owner(
+            &body,
+            ctx,
+            continuation,
+            use_responses_lite,
+            false,
+        )
+        .await
+    }
+
+    pub(super) fn native_websocket_http_fallback(&self, error: &CodexError) -> bool {
+        config::codex_transport() == config::CodexTransport::Auto
+            && self.auto_http_fallback_enabled
+            && should_fallback_to_http(error)
+    }
+
+    pub(crate) async fn stream_raw_websocket_events_for_owner(
+        self: &Arc<Self>,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        use_responses_lite: bool,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        self.start_websocket_value_events_for_owner(
+            body,
+            ctx,
+            continuation,
+            use_responses_lite,
+            true,
+        )
+        .await
+    }
+
+    async fn start_websocket_value_events_for_owner(
+        self: &Arc<Self>,
+        body: &serde_json::Value,
+        ctx: &RequestContext,
+        continuation: Option<&super::continuation::ContinuationReservation>,
+        use_responses_lite: bool,
+        native_events: bool,
+    ) -> Result<super::websocket::CodexWebSocketEventStream, CodexError> {
+        if !body.is_object() {
+            return Err(CodexError::new(
+                400,
+                "Responses request must be an object".into(),
+            ));
+        }
         let auth = self.auth_manager.get_auth().await.map_err(|e| CodexError {
             status: 401,
             message: "Auth error".to_string(),
@@ -2050,6 +2115,8 @@ impl CodexHttpClient {
                     auth,
                     tx,
                     socket_id_publisher,
+                    use_responses_lite,
+                    native_events,
                 )
                 .await;
         });
@@ -2060,12 +2127,14 @@ impl CodexHttpClient {
     #[allow(clippy::too_many_arguments)]
     async fn coordinate_live_websocket_events(
         &self,
-        body: ResponsesRequest,
+        body: serde_json::Value,
         ctx: RequestContext,
         mut continuation: Option<super::continuation::ContinuationReservation>,
         mut auth: StoredAuth,
         tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, CodexError>>,
         socket_id_publisher: super::websocket::CodexWebSocketSocketIdPublisher,
+        use_responses_lite: bool,
+        native_events: bool,
     ) {
         let mut auth_refresh_attempted = false;
         let mut continuation_retry_available = continuation
@@ -2076,8 +2145,7 @@ impl CodexHttpClient {
 
         'attempt: loop {
             socket_id_publisher.publish(None);
-            let ws_headers = match build_codex_headers(&auth, &ctx, body.client_metadata.is_some())
-            {
+            let ws_headers = match build_codex_headers(&auth, &ctx, use_responses_lite) {
                 Ok(headers) => super::websocket::codex_websocket_headers(&headers),
                 Err(err) => {
                     if tx.send(Err(err)).await.is_err() {
@@ -2089,11 +2157,12 @@ impl CodexHttpClient {
                     return;
                 }
             };
-            let ws_body = build_websocket_request(
+            let ws_body = build_raw_websocket_request(
                 &body,
                 continuation
                     .as_ref()
                     .map(super::continuation::ContinuationReservation::candidate),
+                continuation.as_ref().and_then(|r| r.native_delta.as_ref()),
             );
             let start = super::websocket::codex_websocket_event_stream(
                 &self.websocket_client,
@@ -2264,6 +2333,28 @@ impl CodexHttpClient {
 
                 let terminal = item.as_ref().is_err()
                     || item.as_ref().is_ok_and(super::websocket::is_terminal_event);
+                if native_events {
+                    // A raw event is already visible to the client, even if it is
+                    // structural. Never replay behind a published response.created.
+                    if tx.send(item).await.is_err() {
+                        if let Some(reservation) = continuation.as_ref() {
+                            super::websocket::invalidate_codex_websocket_pool_socket(
+                                reservation,
+                                stream.socket_id(),
+                            );
+                        }
+                        abort_abandoned_live_continuation(
+                            continuation.as_ref(),
+                            &socket_id_publisher,
+                        );
+                        return;
+                    }
+                    if terminal {
+                        return;
+                    }
+                    forwarded_any = true;
+                    continue;
+                }
                 match item {
                     Ok(payload) => match super::events::classify_stream_event(&payload) {
                         super::events::CodexStreamEventKind::TerminalFailure => {

@@ -1064,7 +1064,17 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         }
     } else {
         match state.native_responses.as_ref() {
-            Some(backend) => backend.handle(body, context).await,
+            Some(backend) => {
+                if headers
+                    .get("x-claude-code-native-reset")
+                    .is_some_and(|value| value == "true")
+                {
+                    crate::providers::codex::native::reset_native_session(
+                        context.session_id.as_deref(),
+                    );
+                }
+                backend.handle(body, context).await
+            }
             None => openai_error(
                 StatusCode::NOT_FOUND,
                 "not_found_error",

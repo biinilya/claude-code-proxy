@@ -24,6 +24,14 @@ use super::translate::model_allowlist::{
 };
 use super::translate::request::ServiceTier;
 
+pub(crate) fn reset_native_session(session_id: Option<&str>) {
+    if let Some(id) = session_id {
+        let owner = crate::request_identity::ConversationIdentity::Main(id.into());
+        super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+}
+
 pub struct CodexNativeBackend {
     client: Arc<CodexHttpClient>,
 }
@@ -51,6 +59,15 @@ impl CodexNativeBackend {
             monitor.upstream_started(&ctx.req_id);
         }
 
+        if resolved.stream
+            && crate::config::codex_transport() != crate::config::CodexTransport::Http
+            && body.get("previous_response_id").is_none_or(Value::is_null)
+        {
+            return self
+                .handle_websocket(body, ctx, crate::config::codex_previous_response_id())
+                .await;
+        }
+
         let upstream = match self
             .client
             .post_native_responses(&body, &ctx, resolved.use_responses_lite, resolved.stream)
@@ -61,6 +78,154 @@ impl CodexNativeBackend {
         };
 
         passthrough_response(upstream, ctx, self.client.body_idle_timeout_ms())
+    }
+
+    async fn handle_websocket(
+        &self,
+        body: Value,
+        ctx: RequestContext,
+        continuation_enabled: bool,
+    ) -> Response {
+        let owner = ctx
+            .session_id
+            .as_ref()
+            .map(|id| crate::request_identity::ConversationIdentity::Main(id.clone()));
+        let reservation = super::continuation::native_continuation_candidate(
+            owner.as_ref(),
+            &body,
+            continuation_enabled,
+        );
+        let use_responses_lite = body
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(uses_responses_lite)
+            && !body.as_object().is_some_and(has_native_hosted_web_search);
+        let mut events = match self
+            .client
+            .stream_raw_websocket_events_for_owner(
+                &body,
+                &ctx,
+                Some(&reservation),
+                use_responses_lite,
+            )
+            .await
+        {
+            Ok(events) => events,
+            Err(error) => {
+                super::continuation::abort_continuation_for_owner(&reservation);
+                return local_codex_error(error);
+            }
+        };
+        let first = events.recv().await;
+        if let Some(Err(error)) = first {
+            super::continuation::abort_continuation_for_owner(&reservation);
+            if self.client.native_websocket_http_fallback(&error) {
+                return match self
+                    .client
+                    .post_native_responses(&body, &ctx, use_responses_lite, true)
+                    .await
+                {
+                    Ok(response) => {
+                        passthrough_response(response, ctx, self.client.body_idle_timeout_ms())
+                    }
+                    Err(error) => local_codex_error(error),
+                };
+            }
+            return local_codex_error(error);
+        }
+        let outcome = NativeResponseOutcome::default();
+        let state = NativeWebSocketBody {
+            events,
+            first: first.and_then(Result::ok),
+            body,
+            reservation,
+            observer: NativeResponseObserver::new(ctx, true, outcome.clone()),
+            terminal: false,
+        };
+        let stream = futures_util::stream::unfold(Some(state), |state| async move {
+            let mut state = state?;
+            if state.terminal {
+                return None;
+            }
+            let event = match state.first.take() {
+                Some(event) => Some(Ok(event)),
+                None => state.events.recv().await,
+            };
+            match event {
+                Some(Ok(event)) => {
+                    let terminal = super::websocket::is_terminal_event(&event);
+                    if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                        super::continuation::record_native_continuation(
+                            &state.reservation,
+                            &state.body,
+                            &event["response"],
+                            state.events.socket_id(),
+                        );
+                    } else if terminal {
+                        super::continuation::abort_continuation_for_owner(&state.reservation);
+                    }
+                    state.terminal = terminal;
+                    let frame = Bytes::from(format!(
+                        "event: {}\ndata: {}\n\n",
+                        event
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("message"),
+                        event
+                    ));
+                    state.observer.observe(&frame);
+                    if terminal {
+                        state.observer.finish("complete");
+                    }
+                    Some((Ok::<Bytes, io::Error>(frame), Some(state)))
+                }
+                Some(Err(error)) => {
+                    state.observer.finish("read_error");
+                    Some((Err(io::Error::other(error.to_string())), None))
+                }
+                None => {
+                    state.observer.finish("truncated");
+                    Some((
+                        Err(io::Error::other(
+                            "Native WebSocket ended without a terminal event",
+                        )),
+                        None,
+                    ))
+                }
+            }
+        });
+        let mut response = Response::new(Body::from_stream(stream));
+        response.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        response.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+        response.extensions_mut().insert(outcome);
+        response
+    }
+}
+
+struct NativeWebSocketBody {
+    events: super::websocket::CodexWebSocketEventStream,
+    first: Option<Value>,
+    body: Value,
+    reservation: super::continuation::ContinuationReservation,
+    observer: NativeResponseObserver,
+    terminal: bool,
+}
+
+impl Drop for NativeWebSocketBody {
+    fn drop(&mut self) {
+        if !self.terminal {
+            super::websocket::invalidate_codex_websocket_pool_socket(
+                &self.reservation,
+                self.events.socket_id(),
+            );
+            super::continuation::abort_continuation_for_owner(&self.reservation);
+        }
     }
 }
 
@@ -609,6 +774,220 @@ fn retain_boundary_prefix(bytes: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_websocket_preserves_raw_fields_reuses_socket_and_replays_after_loss() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let _registry =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner =
+            crate::request_identity::ConversationIdentity::Main("native-raw-ws-test".into());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let output =
+            json!({"type":"future_output", "encrypted_content":"opaque", "unknown":{"a":1}});
+        let server_output = output.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let server = tokio::spawn(async move {
+            for connection in 0..3 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                for turn in if connection == 0 {
+                    0..2
+                } else {
+                    connection + 1..connection + 2
+                } {
+                    let payload = loop {
+                        match ws.next().await.unwrap().unwrap() {
+                            Message::Ping(v) => ws.send(Message::Pong(v)).await.unwrap(),
+                            Message::Text(v) => break serde_json::from_str::<Value>(&v).unwrap(),
+                            other => panic!("unexpected frame {other:?}"),
+                        }
+                    };
+                    tx.send(payload).await.unwrap();
+                    ws.send(Message::Text(json!({"type":"response.future_event", "unknown_event_payload":{"native":true}}).to_string())).await.unwrap();
+                    if turn == 3 {
+                        ws.send(Message::Text(json!({"type":"response.failed", "response":{"id":"resp_failed", "status":"failed", "error":{"message":"native failure", "future_error_field":true}}}).to_string())).await.unwrap();
+                        continue;
+                    }
+                    ws.send(Message::Text(json!({"type":"response.completed", "response":{
+                        "id":format!("resp_native_{turn}"), "status":"completed", "output":[server_output.clone()],
+                        "usage":{"input_tokens":3,"output_tokens":2}, "future_response_field":true
+                    }}).to_string())).await.unwrap();
+                }
+            }
+        });
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{addr}/responses"),
+            1000,
+            1000,
+        );
+        client
+            .auth_manager()
+            .set_test_auth(super::super::auth::token_store::StoredAuth {
+                access: "test".into(),
+                refresh: String::new(),
+                account_id: Some("acct".into()),
+                expires: u64::MAX,
+            });
+        let backend = CodexNativeBackend {
+            client: Arc::new(client),
+        };
+        let mut ctx = observer_context();
+        ctx.session_id = Some("native-raw-ws-test".into());
+        let first = json!({"model":"gpt-5.5", "stream":true, "input":[{"type":"future_input","blob":{"x":7}}], "future_option":{"deep":[1,2]}, "reasoning":{"effort":"high","future":true}});
+        let response = backend
+            .handle_websocket(first.clone(), ctx.clone(), true)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("future_response_field"));
+        let payload = rx.recv().await.unwrap();
+        assert_eq!(payload["future_option"], first["future_option"]);
+        assert_eq!(payload["input"], first["input"]);
+        assert_eq!(payload["type"], "response.create");
+        assert!(payload.get("stream").is_none());
+        let mut second = first.clone();
+        second["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend([output.clone(), json!({"type":"future_result","result":42})]);
+        let response = backend
+            .handle_websocket(second.clone(), ctx.clone(), true)
+            .await;
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let delta = rx.recv().await.unwrap();
+        assert_eq!(delta["previous_response_id"], "resp_native_0");
+        assert_eq!(
+            delta["input"],
+            json!([{"type":"future_result","result":42}])
+        );
+        assert_eq!(delta["reasoning"], first["reasoning"]);
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let mut third = second;
+        third["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend([output.clone(), json!({"type":"future_result","result":43})]);
+        let response = backend
+            .handle_websocket(third.clone(), ctx.clone(), true)
+            .await;
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let replay = rx.recv().await.unwrap();
+        assert!(replay.get("previous_response_id").is_none());
+        assert_eq!(replay["input"], third["input"]);
+        assert_eq!(replay["future_option"], third["future_option"]);
+        reset_native_session(ctx.session_id.as_deref());
+        assert!(!super::super::continuation::has_continuation_for_owner_for_tests(&owner));
+        let mut fourth = third;
+        fourth["input"]
+            .as_array_mut()
+            .unwrap()
+            .extend([output, json!({"type":"future_result","result":44})]);
+        let response = backend.handle_websocket(fourth.clone(), ctx, true).await;
+        let outcome = response
+            .extensions()
+            .get::<NativeResponseOutcome>()
+            .unwrap()
+            .clone();
+        let failed = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let failed = String::from_utf8_lossy(&failed);
+        assert!(failed.contains("unknown_event_payload"));
+        assert!(failed.contains("future_error_field"));
+        assert_eq!(outcome.failure().as_deref(), Some("native failure"));
+        assert!(!super::super::continuation::has_continuation_for_owner_for_tests(&owner));
+        let reset_replay = rx.recv().await.unwrap();
+        assert!(reset_replay.get("previous_response_id").is_none());
+        assert_eq!(reset_replay["input"], fourth["input"]);
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+    }
+
+    #[tokio::test]
+    async fn native_websocket_body_drop_cancels_and_clears_owner() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let _registry =
+            super::super::continuation::lock_continuation_registry_for_async_tests().await;
+        let _pool = super::super::websocket::lock_codex_websocket_pool_for_tests().await;
+        let owner =
+            crate::request_identity::ConversationIdentity::Main("native-cancel-test".into());
+        super::super::continuation::clear_continuation_for_owner(Some(&owner));
+        super::super::websocket::invalidate_codex_websocket_pool_owner(&owner);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            assert!(matches!(
+                ws.next().await.unwrap().unwrap(),
+                Message::Text(_)
+            ));
+            ws.send(Message::Text(
+                json!({"type":"response.created","response":{"id":"resp_wait"}}).to_string(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Ping(v))) => ws.send(Message::Pong(v)).await.unwrap(),
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+        });
+        let client = CodexHttpClient::new_for_test(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            format!("http://{addr}/responses"),
+            1000,
+            1000,
+        );
+        client
+            .auth_manager()
+            .set_test_auth(super::super::auth::token_store::StoredAuth {
+                access: "test".into(),
+                refresh: String::new(),
+                account_id: Some("acct".into()),
+                expires: u64::MAX,
+            });
+        let backend = CodexNativeBackend {
+            client: Arc::new(client),
+        };
+        let mut ctx = observer_context();
+        ctx.session_id = Some("native-cancel-test".into());
+        let response = backend
+            .handle_websocket(
+                json!({"model":"gpt-5.5","stream":true,"input":[]}),
+                ctx,
+                true,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!super::super::continuation::has_continuation_for_owner_for_tests(&owner));
+        assert!(super::super::websocket::pooled_socket_id_for_tests(&owner).is_none());
+    }
 
     fn request(body: Value) -> Value {
         body
