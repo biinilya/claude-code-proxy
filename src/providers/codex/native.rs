@@ -300,8 +300,21 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
         );
     }
 
+    let use_responses_lite = uses_responses_lite(&model) && !hosted_web_search;
+    if use_responses_lite {
+        // The lite lane rejects any other reasoning context; the Messages
+        // translation sets the same value.
+        let reasoning = object
+            .entry("reasoning")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !reasoning.is_object() {
+            *reasoning = Value::Object(Map::new());
+        }
+        reasoning["context"] = json!("all_turns");
+    }
+
     Ok(NativeResolved {
-        use_responses_lite: uses_responses_lite(&model) && !hosted_web_search,
+        use_responses_lite,
         model,
         stream: object
             .get("stream")
@@ -1065,6 +1078,25 @@ mod tests {
         assert_eq!(observer.captured_events.len(), MAX_STREAM_CAPTURE_EVENTS);
         assert_eq!(observer.captured_events_truncated, 10);
         observer.finished = true;
+    }
+
+    #[test]
+    fn native_responses_lite_forces_all_turns_reasoning_context() {
+        for reasoning in [
+            json!({"effort": "high", "context": "last_turn"}),
+            json!(null),
+        ] {
+            let mut body = json!({"model": "gpt-6.1-sol", "reasoning": reasoning, "input": []});
+            let resolved = shape_native_request(&mut body).unwrap();
+            assert!(resolved.use_responses_lite);
+            assert_eq!(body["reasoning"]["context"], "all_turns");
+        }
+        let mut absent = json!({"model": "gpt-6.1-sol", "input": []});
+        shape_native_request(&mut absent).unwrap();
+        assert_eq!(absent["reasoning"]["context"], "all_turns");
+        let mut effort = json!({"model": "gpt-6.1-sol", "reasoning": {"effort": "low"}});
+        shape_native_request(&mut effort).unwrap();
+        assert_eq!(effort["reasoning"]["effort"], "low");
     }
 
     #[test]
