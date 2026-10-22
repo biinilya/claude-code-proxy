@@ -311,6 +311,7 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
             *reasoning = Value::Object(Map::new());
         }
         reasoning["context"] = json!("all_turns");
+        object.insert("parallel_tool_calls".into(), json!(false));
     }
 
     Ok(NativeResolved {
@@ -1094,6 +1095,7 @@ mod tests {
         let mut absent = json!({"model": "gpt-6.1-sol", "input": []});
         shape_native_request(&mut absent).unwrap();
         assert_eq!(absent["reasoning"]["context"], "all_turns");
+        assert_eq!(absent["parallel_tool_calls"], false);
         let mut effort = json!({"model": "gpt-6.1-sol", "reasoning": {"effort": "low"}});
         shape_native_request(&mut effort).unwrap();
         assert_eq!(effort["reasoning"]["effort"], "low");
